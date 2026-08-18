@@ -1,0 +1,5 @@
+config.sh
+gcs-key.json
+*.tar.gz
+backup.log
+.work_*/
