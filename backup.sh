@@ -118,7 +118,7 @@ fi
 # 4. UFW Firewall (opzionale — salta se non installato)
 # =============================================================================
 log "[4/5] Backup UFW..."
-if [ -d /etc/ufw ]; then
+if command -v ufw >/dev/null 2>&1; then
     mkdir -p "${WORK_DIR}/ufw"
     sudo cp -r /etc/ufw "${WORK_DIR}/ufw/etc_ufw"
     sudo chown -R "$(whoami)" "${WORK_DIR}/ufw/"
