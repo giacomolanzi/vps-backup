@@ -105,7 +105,7 @@ sudo cp -r /etc/ssh/sshd_config.d "${WORK_DIR}/ssh/" 2>/dev/null || true
 [ -f ~/.ssh/authorized_keys ] && cp ~/.ssh/authorized_keys "${WORK_DIR}/ssh/authorized_keys"
 whoami > "${WORK_DIR}/ssh/ssh_user.txt"
 sudo chown -R "$(whoami)" "${WORK_DIR}/ssh/"
-SSH_PORT_LOG=$(grep '^Port' /etc/ssh/sshd_config | awk '{print $2}')
+SSH_PORT_LOG=$(grep '^Port' /etc/ssh/sshd_config | awk '{print $2}' || true)
 log "   SSH: porta ${SSH_PORT_LOG:-22 (default)}, chiavi salvate"
 
 if [ -d /etc/fail2ban ]; then
