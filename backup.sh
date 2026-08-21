@@ -100,7 +100,7 @@ if ${DRY_RUN}; then
     echo
     echo "Stack Docker trovati sotto ${DOCKER_DIR}:"
     find "${DOCKER_DIR}" -mindepth 1 \( -name 'compose.yml' -o -name 'docker-compose.yml' \) 2>/dev/null \
-        | sed "s|^${DOCKER_DIR}/||" | sed 's/^/  - /'
+        | sed "s|^${DOCKER_DIR}/||" | sed 's/^/  - /' || true
     echo
     echo "Pattern di esclusione applicati:"
     for PATTERN in "${DEFAULT_EXCLUDE_PATTERNS[@]}"; do echo "  - ${PATTERN} (default)"; done
@@ -115,8 +115,16 @@ if ${DRY_RUN}; then
         echo "PostgreSQL: non configurato o non attivo, verrebbe saltato"
     fi
     echo
-    ESTIMATE_BYTES=$(LC_ALL=C tar cf /dev/null "${EXCLUDE_ARGS[@]}" --totals "${DOCKER_DIR}" 2>&1 >/dev/null | grep -oE 'written: [0-9]+' | grep -oE '[0-9]+' || echo 0)
-    echo "Dimensione stimata di docker/ non compressa (esclusioni applicate): $(numfmt --to=iec "${ESTIMATE_BYTES:-0}" 2>/dev/null || echo "${ESTIMATE_BYTES:-0} bytes")"
+    # "|| true" sul tar: può uscire non-zero per sottocartelle a permessi
+    # ristretti (es. certificati Caddy leggibili solo da root) pur avendo
+    # comunque stampato il totale — isolato qui per non far incespicare
+    # pipefail sul resto della pipeline (altrimenti, con grep a valle che
+    # trova un match valido, sia l'output reale sia un eventuale fallback
+    # finirebbero concatenati nella stessa variabile).
+    ESTIMATE_BYTES=$({ LC_ALL=C tar cf /dev/null "${EXCLUDE_ARGS[@]}" --totals "${DOCKER_DIR}" 2>&1 >/dev/null || true; } \
+        | grep -oE 'written: [0-9]+' | grep -oE '[0-9]+' | head -1)
+    [ -z "${ESTIMATE_BYTES}" ] && ESTIMATE_BYTES=0
+    echo "Dimensione stimata di docker/ non compressa (esclusioni applicate): $(numfmt --to=iec "${ESTIMATE_BYTES}" 2>/dev/null || echo "${ESTIMATE_BYTES} bytes")"
     [ -n "${PREV_ARCHIVE:-}" ] && echo "Ultimo backup reale: $(basename "${PREV_ARCHIVE}") ($(numfmt --to=iec "${PREV_SIZE_BYTES}" 2>/dev/null || echo "${PREV_SIZE_BYTES} bytes"))"
     echo
     trap - ERR EXIT
