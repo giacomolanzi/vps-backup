@@ -21,6 +21,9 @@ PG_USER=""
 
 # Percorsi da escludere dal tar, relativi alla cartella "docker"
 # (es. dati Postgres già coperti da pg_dumpall, per evitare doppioni)
+# NB: .cache/.npm/node_modules/__pycache__/.venv sono già esclusi ovunque
+# automaticamente da backup.sh (DEFAULT_EXCLUDE_PATTERNS) — qui vanno solo
+# esclusioni specifiche di questo host.
 DOCKER_EXCLUDES=(
     # "postgres/postgres-data"
 )

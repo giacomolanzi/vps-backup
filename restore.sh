@@ -172,16 +172,15 @@ else
     log "   PostgreSQL non configurato, salto"
 fi
 
-for COMPOSE_FILE in "${DOCKER_DIR}"/*/compose.yml; do
-    [ -f "${COMPOSE_FILE}" ] || continue
+while IFS= read -r COMPOSE_FILE; do
     DIR="$(dirname "${COMPOSE_FILE}")"
     NAME="$(basename "${DIR}")"
     [ "${NAME}" = "postgres" ] && continue
     cd "${DIR}"
     docker compose up -d 2>/dev/null \
-        && log "   Avviato: ${NAME}" \
+        && log "   Avviato: ${NAME} (${COMPOSE_FILE#"${DOCKER_DIR}"/})" \
         || warn "   Errore: ${NAME} (controlla manualmente)"
-done
+done < <(find "${DOCKER_DIR}" -mindepth 1 \( -name 'compose.yml' -o -name 'docker-compose.yml' \) | sort)
 
 # =============================================================================
 echo ""

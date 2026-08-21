@@ -29,14 +29,52 @@ bind-mount):
 Funziona identico se lo metti sotto `/opt`, `~/srv`, o qualsiasi altra root —
 `backup.sh` risolve `../docker` relativo a se stesso.
 
+**Stack annidati a qualsiasi profondità:** dentro `docker/` puoi organizzare
+gli stack come preferisci, anche in sottocartelle su più livelli (es.
+`docker/clienti/acme/n8n/compose.yml`). Sia `backup.sh` (che archivia
+l'intera cartella `docker/` con `tar`, che ricorre sempre in ogni sottolivello)
+sia `restore.sh` (che cerca ogni `compose.yml`/`docker-compose.yml` con `find`,
+non con un semplice `docker/*/compose.yml`) coprono qualunque profondità, non
+solo un livello sotto `docker/`.
+
+**Volumi esterni: monta i dati dentro la cartella dello stack.** Se un
+container ha bisogno di un bind-mount per dati persistenti, fallo puntare
+dentro la cartella dello stack stesso — non altrove sul filesystem:
+
+```
+docker/n8n/
+  compose.yml
+  data/            ← bind-mount: "./data:/home/node/.n8n"  ✅ backuppato
+```
+
+```
+# ❌ evita:
+#   "/mnt/altrove/n8n-data:/home/node/.n8n"
+# non essendo dentro "docker/", questo mount NON finisce nel tar.
+```
+
+I **named Docker volume** (quelli "virtuali", gestiti da Docker e non da un
+path del filesystem) sono invece sempre inclusi automaticamente, ovunque siano
+usati — vedi step 5 sotto. La regola sui bind-mount vale solo per i mount con
+un path host esplicito.
+
+`backup.sh` rileva comunque, ad ogni run, eventuali bind-mount di container
+attivi che puntano fuori da `docker/` e li segnala (log + `MANIFEST.txt`),
+escludendo i mount di introspezione tipici di tool di monitoring (Glances su
+`/`, Diun sul `docker.sock`, `/proc`, `/sys`, `/etc`, ...). Se compare un
+avviso per un mount che contiene dati veri, spostalo dentro lo stack.
+
 ```
 ogni notte alle 02:00
     → backup.sh  (legge config.sh)
         1. pg_dumpall + dump individuali DB (solo se PG_CONTAINER è impostato)
-        2. tar della cartella "docker" (compose files, dati, bind mount)
+        2. tar della cartella "docker" (tutti gli stack, qualsiasi profondità;
+           esclude cache/.npm/node_modules/.venv/__pycache__ automaticamente,
+           più eventuali DOCKER_EXCLUDES specifiche dell'host)
         3. SSH + Fail2ban
         4. UFW (solo se installato)
-        5. Named Docker volumes
+        5. Named Docker volumes (tutti quelli sull'host, non solo quelli usati
+           dagli stack sotto "docker/")
         → <hostname>_backup_YYYY-MM-DD_HH-MM.tar.gz
         → upload su Google Cloud Storage (se configurato)
         → notifica Discord (se configurato)
@@ -101,6 +139,12 @@ tail -f /opt/backups/backup.log
 > Se usi Postgres, escludi la sua directory dati dal tar via `DOCKER_EXCLUDES`
 > in `config.sh` (es. `"postgres/postgres-data"`) — viene già coperta da
 > `pg_dumpall`, evitando di duplicarla e rischiare corruzione da file aperti.
+
+> **Esclusioni automatiche:** `.cache`, `.npm`, `node_modules`, `__pycache__`,
+> `.venv` vengono esclusi dal tar ovunque si trovino sotto `docker/`, su ogni
+> host, senza bisogno di configurazione (pattern `DEFAULT_EXCLUDE_PATTERNS` in
+> `backup.sh`). Usa `DOCKER_EXCLUDES` in `config.sh` solo per casi specifici
+> dell'host che non rientrano in questi pattern.
 
 > Servizi **non containerizzati** (es. un processo nativo via systemd) non
 > sono coperti automaticamente: se hanno dati importanti, mettili comunque
@@ -191,9 +235,10 @@ dove desideri che finisca `docker/` come sibling.
 
 **Nessuna modifica necessaria.** Il sistema è dinamico:
 
-- Nuovo servizio in `docker/<nome>/compose.yml` → incluso automaticamente
+- Nuovo servizio in `docker/<nome>/compose.yml` (o annidato più in profondità) → incluso automaticamente
 - Nuovo database PostgreSQL → incluso automaticamente in `pg_dumpall`
-- Nuovo named volume → incluso automaticamente da `docker volume ls`
+- Nuovo named volume → incluso automaticamente da `docker volume ls`, ovunque sia usato
+- Nuova cache (`.cache`, `.npm`, `node_modules`, ...) → esclusa automaticamente dal tar
 
 ---
 

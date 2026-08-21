@@ -7,8 +7,9 @@
 # Nessun path assoluto da configurare: la cartella da backuppare viene dedotta
 # dalla posizione di questo script.
 #
-# Covers: PostgreSQL (opzionale), directory Docker, SSH, Fail2ban (opzionale),
-#         UFW (opzionale), Docker named volumes
+# Covers: PostgreSQL (opzionale), directory Docker (tutti gli stack, a
+#         qualsiasi profondità), SSH, Fail2ban (opzionale), UFW (opzionale),
+#         Docker named volumes, audit dei bind mount esterni non coperti
 # Usage: ./backup.sh [--no-volumes]
 # =============================================================================
 set -euo pipefail
@@ -83,7 +84,21 @@ fi
 # =============================================================================
 log "[2/5] Backup directory Docker (${DOCKER_DIR})..."
 
+# Pattern generici (cache/junk) esclusi automaticamente ovunque, a qualsiasi
+# profondità sotto DOCKER_DIR — nessuna config richiesta per il caso comune.
+# Per esclusioni specifiche dell'host usa DOCKER_EXCLUDES in config.sh.
+DEFAULT_EXCLUDE_PATTERNS=(
+    "*/.cache"
+    "*/.npm"
+    "*/node_modules"
+    "*/__pycache__"
+    "*/.venv"
+)
+
 EXCLUDE_ARGS=()
+for PATTERN in "${DEFAULT_EXCLUDE_PATTERNS[@]}"; do
+    EXCLUDE_ARGS+=("--exclude=${DOCKER_DIR}/${PATTERN}")
+done
 for EXCL in "${DOCKER_EXCLUDES[@]:-}"; do
     [ -z "${EXCL}" ] && continue
     EXCLUDE_ARGS+=("--exclude=${DOCKER_DIR}/${EXCL}")
@@ -93,7 +108,20 @@ tar czf "${WORK_DIR}/docker.tar.gz" \
     "${EXCLUDE_ARGS[@]}" \
     --warning=no-file-changed \
     "${DOCKER_DIR}" 2>/dev/null || true
-log "   Archiviato: ${DOCKER_DIR}"
+log "   Archiviato: ${DOCKER_DIR} (tutti gli stack, a qualsiasi profondità)"
+
+# Audit: bind mount di container attivi che puntano FUORI da DOCKER_DIR —
+# non vengono inclusi né dal tar sopra né dai named volume più sotto.
+# Esclude i mount di introspezione host tipici di tool di monitoring
+# (Glances/Netdata su "/", Diun sul docker.sock, /proc, /sys, /etc, ...).
+EXTERNAL_MOUNTS=$(docker ps -q 2>/dev/null | xargs -r -I{} docker inspect {} \
+    --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' 2>/dev/null \
+    | sort -u | grep -v "^${DOCKER_DIR}" \
+    | grep -vE '^(/proc|/sys|/dev|/etc|/var/run|/run)(/|$)|^/$' || true)
+if [ -n "${EXTERNAL_MOUNTS}" ]; then
+    warn "Bind mount fuori da ${DOCKER_DIR} (NON inclusi nel backup):"
+    echo "${EXTERNAL_MOUNTS}" | while read -r MNT; do warn "   - ${MNT}"; done
+fi
 
 # =============================================================================
 # 3. SSH + Fail2ban
@@ -173,6 +201,10 @@ $(docker ps --format "  - {{.Names}}: {{.Image}}")
 RETI DOCKER
 -----------
 $(docker network ls --format "  - {{.Name}} ({{.Driver}})")
+
+BIND MOUNT ESTERNI A ${DOCKER_DIR} (NON backuppati)
+----------------------------------------------------
+$(if [ -n "${EXTERNAL_MOUNTS}" ]; then echo "${EXTERNAL_MOUNTS}" | sed 's/^/  - /'; else echo "  (nessuno)"; fi)
 
 RESTORE
 -------
