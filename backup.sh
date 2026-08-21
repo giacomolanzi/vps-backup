@@ -9,10 +9,22 @@
 #
 # Covers: PostgreSQL (opzionale), directory Docker (tutti gli stack, a
 #         qualsiasi profondità), SSH, Fail2ban (opzionale), UFW (opzionale),
-#         Docker named volumes, audit dei bind mount esterni non coperti
-# Usage: ./backup.sh [--no-volumes]
+#         Docker named volumes, audit dei bind mount esterni non coperti,
+#         checksum + verifica integrità, cifratura opzionale, alert su
+#         anomalie di dimensione
+# Usage: ./backup.sh [--no-volumes] [--dry-run]
 # =============================================================================
 set -euo pipefail
+umask 077
+
+DRY_RUN=false
+NO_VOLUMES=false
+for ARG in "$@"; do
+    case "${ARG}" in
+        --dry-run) DRY_RUN=true ;;
+        --no-volumes) NO_VOLUMES=true ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER_DIR="$(cd "${SCRIPT_DIR}/../docker" && pwd)"
@@ -53,6 +65,65 @@ on_error() {
 trap 'on_error $LINENO' ERR
 trap '[ -d "${WORK_DIR}" ] && rm -rf "${WORK_DIR}"' EXIT
 
+# Pattern generici (cache/junk) esclusi automaticamente ovunque, a qualsiasi
+# profondità sotto DOCKER_DIR — nessuna config richiesta per il caso comune.
+# Per esclusioni specifiche dell'host usa DOCKER_EXCLUDES in config.sh.
+DEFAULT_EXCLUDE_PATTERNS=(
+    "*/.cache"
+    "*/.npm"
+    "*/node_modules"
+    "*/__pycache__"
+    "*/.venv"
+)
+EXCLUDE_ARGS=()
+for PATTERN in "${DEFAULT_EXCLUDE_PATTERNS[@]}"; do
+    EXCLUDE_ARGS+=("--exclude=${DOCKER_DIR}/${PATTERN}")
+done
+for EXCL in "${DOCKER_EXCLUDES[@]:-}"; do
+    [ -z "${EXCL}" ] && continue
+    EXCLUDE_ARGS+=("--exclude=${DOCKER_DIR}/${EXCL}")
+done
+
+# Dimensione dell'ultimo backup riuscito, per l'alert di anomalia più sotto
+# (va letta ORA, prima di creare/ruotare qualunque cosa).
+PREV_ARCHIVE=$(ls -t "${BACKUP_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' | head -1 || true)
+PREV_SIZE_BYTES=0
+if [ -n "${PREV_ARCHIVE:-}" ] && [ -f "${PREV_ARCHIVE}" ]; then
+    PREV_SIZE_BYTES=$(stat -c%s "${PREV_ARCHIVE}" 2>/dev/null || echo 0)
+fi
+
+# =============================================================================
+# --dry-run: mostra cosa verrebbe fatto, non tocca nulla, non carica nulla.
+# =============================================================================
+if ${DRY_RUN}; then
+    log "=== DRY RUN: nessuna modifica verrà effettuata ==="
+    echo
+    echo "Stack Docker trovati sotto ${DOCKER_DIR}:"
+    find "${DOCKER_DIR}" -mindepth 1 \( -name 'compose.yml' -o -name 'docker-compose.yml' \) 2>/dev/null \
+        | sed "s|^${DOCKER_DIR}/||" | sed 's/^/  - /'
+    echo
+    echo "Pattern di esclusione applicati:"
+    for PATTERN in "${DEFAULT_EXCLUDE_PATTERNS[@]}"; do echo "  - ${PATTERN} (default)"; done
+    for EXCL in "${DOCKER_EXCLUDES[@]:-}"; do [ -z "${EXCL}" ] && continue; echo "  - ${EXCL} (config.sh)"; done
+    echo
+    echo "Named Docker volumes che verrebbero inclusi:"
+    docker volume ls --format '  - {{.Name}}'
+    echo
+    if [ -n "${PG_CONTAINER:-}" ] && docker ps --format '{{.Names}}' | grep -q "^${PG_CONTAINER}$"; then
+        echo "PostgreSQL: verrebbe dumpato (pg_dumpall + dump individuali) da ${PG_CONTAINER}"
+    else
+        echo "PostgreSQL: non configurato o non attivo, verrebbe saltato"
+    fi
+    echo
+    ESTIMATE_BYTES=$(LC_ALL=C tar cf /dev/null "${EXCLUDE_ARGS[@]}" --totals "${DOCKER_DIR}" 2>&1 >/dev/null | grep -oE 'written: [0-9]+' | grep -oE '[0-9]+' || echo 0)
+    echo "Dimensione stimata di docker/ non compressa (esclusioni applicate): $(numfmt --to=iec "${ESTIMATE_BYTES:-0}" 2>/dev/null || echo "${ESTIMATE_BYTES:-0} bytes")"
+    [ -n "${PREV_ARCHIVE:-}" ] && echo "Ultimo backup reale: $(basename "${PREV_ARCHIVE}") ($(numfmt --to=iec "${PREV_SIZE_BYTES}" 2>/dev/null || echo "${PREV_SIZE_BYTES} bytes"))"
+    echo
+    trap - ERR EXIT
+    log "=== Fine dry-run — nessun file creato, nessun upload effettuato ==="
+    exit 0
+fi
+
 # =============================================================================
 log "=== Backup avviato: ${BACKUP_DATE} (docker dir: ${DOCKER_DIR}) ==="
 mkdir -p "${WORK_DIR}"
@@ -83,26 +154,6 @@ fi
 # 2. Directory Docker
 # =============================================================================
 log "[2/5] Backup directory Docker (${DOCKER_DIR})..."
-
-# Pattern generici (cache/junk) esclusi automaticamente ovunque, a qualsiasi
-# profondità sotto DOCKER_DIR — nessuna config richiesta per il caso comune.
-# Per esclusioni specifiche dell'host usa DOCKER_EXCLUDES in config.sh.
-DEFAULT_EXCLUDE_PATTERNS=(
-    "*/.cache"
-    "*/.npm"
-    "*/node_modules"
-    "*/__pycache__"
-    "*/.venv"
-)
-
-EXCLUDE_ARGS=()
-for PATTERN in "${DEFAULT_EXCLUDE_PATTERNS[@]}"; do
-    EXCLUDE_ARGS+=("--exclude=${DOCKER_DIR}/${PATTERN}")
-done
-for EXCL in "${DOCKER_EXCLUDES[@]:-}"; do
-    [ -z "${EXCL}" ] && continue
-    EXCLUDE_ARGS+=("--exclude=${DOCKER_DIR}/${EXCL}")
-done
 
 tar czf "${WORK_DIR}/docker.tar.gz" \
     "${EXCLUDE_ARGS[@]}" \
@@ -160,7 +211,7 @@ fi
 # =============================================================================
 # 5. Named Docker volumes
 # =============================================================================
-if [[ "${1:-}" != "--no-volumes" ]]; then
+if ! ${NO_VOLUMES}; then
     log "[5/5] Backup Docker named volumes..."
     mkdir -p "${WORK_DIR}/docker_volumes"
     VOLS=$(docker volume ls -q)
@@ -212,31 +263,67 @@ Posiziona questa cartella "backups" affiancata a una cartella "docker" (anche
 vuota, verrà creata) ed esegui: sudo bash restore.sh
 EOF
 
-cp "${SCRIPT_DIR}/config.sh" "${WORK_DIR}/config.sh"
+# config.sh viene incluso per comodità di restore, ma con il webhook Discord
+# redatto: non deve propagarsi in chiaro dentro l'archivio.
+sed 's/^DISCORD_WEBHOOK=.*/DISCORD_WEBHOOK=""  # redatto dal backup — reimposta a mano dopo il restore/' \
+    "${SCRIPT_DIR}/config.sh" > "${WORK_DIR}/config.sh"
 if [ -f "${SCRIPT_DIR}/restore.sh" ]; then
     cp "${SCRIPT_DIR}/restore.sh" "${WORK_DIR}/restore.sh"
     chmod +x "${WORK_DIR}/restore.sh"
 fi
 
 # =============================================================================
-# Archivio finale
+# Archivio finale + verifica integrità + cifratura opzionale + checksum
 # =============================================================================
 log "Creazione archivio finale..."
 tar czf "${ARCHIVE}" -C "${BACKUP_BASE}" ".work_${BACKUP_DATE}/"
+
+# Verifica integrità PRIMA di ruotare i backup vecchi: se l'archivio appena
+# creato è corrotto, questo comando fallisce, il trap ERR notifica su Discord
+# e lo script si interrompe qui — senza cancellare nessun backup precedente.
+tar tzf "${ARCHIVE}" >/dev/null
+log "   Integrità verificata (tar tzf)"
+
+if [ -n "${ENCRYPT_RECIPIENT:-}" ]; then
+    if command -v age >/dev/null 2>&1; then
+        age -r "${ENCRYPT_RECIPIENT}" -o "${ARCHIVE}.age" "${ARCHIVE}"
+        rm -f "${ARCHIVE}"
+        ARCHIVE="${ARCHIVE}.age"
+        log "   Archivio cifrato (age): $(basename "${ARCHIVE}")"
+    else
+        warn "ENCRYPT_RECIPIENT impostato ma 'age' non è installato — archivio NON cifrato"
+    fi
+fi
+
+sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+log "   Checksum: $(cut -d' ' -f1 "${ARCHIVE}.sha256")"
+
 SIZE=$(du -sh "${ARCHIVE}" | cut -f1)
+SIZE_BYTES=$(stat -c%s "${ARCHIVE}" 2>/dev/null || echo 0)
 log "=== Backup completato: $(basename "${ARCHIVE}") (${SIZE}) ==="
+
+SIZE_WARNING=""
+if [ "${PREV_SIZE_BYTES}" -gt 0 ] && [ "${SIZE_BYTES}" -gt 0 ]; then
+    RATIO=$(awk -v a="${SIZE_BYTES}" -v b="${PREV_SIZE_BYTES}" 'BEGIN { printf "%.2f", a/b }')
+    if awk -v r="${RATIO}" 'BEGIN { exit !(r > 2 || r < 0.5) }'; then
+        PCT=$(awk -v r="${RATIO}" 'BEGIN { printf "%+.0f", (r-1)*100 }')
+        PREV_HUMAN=$(numfmt --to=iec "${PREV_SIZE_BYTES}" 2>/dev/null || echo "${PREV_SIZE_BYTES} bytes")
+        SIZE_WARNING="\\n⚠️ **Dimensione anomala:** ${SIZE} vs ${PREV_HUMAN} nel backup precedente (${PCT}%) — controlla se è cambiato qualcosa"
+        warn "Dimensione anomala rispetto al backup precedente: ${SIZE} vs ${PREV_HUMAN} (${PCT}%)"
+    fi
+fi
 
 rm -rf "${WORK_DIR}"
 trap - EXIT
 
 # =============================================================================
-# Rotazione
+# Rotazione (copre sia .tar.gz che .tar.gz.age, più i rispettivi .sha256)
 # =============================================================================
 log "Rotazione: mantengo gli ultimi ${KEEP_BACKUPS} backup..."
-ls -t "${BACKUP_BASE}"/"$(hostname)"_backup_*.tar.gz 2>/dev/null \
+ls -t "${BACKUP_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' \
     | tail -n "+$((KEEP_BACKUPS + 1))" \
-    | xargs -r rm -f
-REMAINING=$(ls "${BACKUP_BASE}"/"$(hostname)"_backup_*.tar.gz 2>/dev/null | wc -l)
+    | while read -r OLD; do rm -f "${OLD}" "${OLD}.sha256"; done
+REMAINING=$(ls "${BACKUP_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' | wc -l)
 log "Backup disponibili: ${REMAINING}"
 
 # =============================================================================
@@ -247,10 +334,11 @@ if [ -n "${GCS_BUCKET:-}" ] && [ -f "${GCS_KEY}" ]; then
     log "Upload su GCS: ${GCS_BUCKET}..."
     docker run --rm \
         -v "${ARCHIVE}:/data/$(basename "${ARCHIVE}"):ro" \
+        -v "${ARCHIVE}.sha256:/data/$(basename "${ARCHIVE}").sha256:ro" \
         -v "${GCS_KEY}:/key.json:ro" \
         google/cloud-sdk:alpine \
         sh -c "gcloud auth activate-service-account --key-file=/key.json -q \
-               && gsutil cp '/data/$(basename "${ARCHIVE}")' '${GCS_BUCKET}/'" \
+               && gsutil cp '/data/$(basename "${ARCHIVE}")' '/data/$(basename "${ARCHIVE}").sha256' '${GCS_BUCKET}/'" \
     && { log "Upload completato: ${GCS_BUCKET}/$(basename "${ARCHIVE}")"; GCS_OK=true; } \
     || warn "Upload GCS fallito — il backup locale è comunque disponibile"
 else
@@ -262,4 +350,4 @@ fi
 # =============================================================================
 GCS_STATUS=$( $GCS_OK && echo "☁️ GCS: caricato" || echo "⚠️ GCS: upload fallito o non configurato (backup locale OK)" )
 discord 3066993 "✅ Backup completato — $(hostname)" \
-    "**Data:** ${BACKUP_DATE}\\n**Dimensione:** ${SIZE}\\n**Backup locali:** ${REMAINING}/${KEEP_BACKUPS}\\n${GCS_STATUS}"
+    "**Data:** ${BACKUP_DATE}\\n**Dimensione:** ${SIZE}\\n**Backup locali:** ${REMAINING}/${KEEP_BACKUPS}\\n${GCS_STATUS}${SIZE_WARNING}"

@@ -32,3 +32,10 @@ DOCKER_EXCLUDES=(
 DOCKER_NETWORKS=(
     # "homedeb_net"
 )
+
+# Cifratura opzionale dell'archivio finale (richiede il binario "age" — se non
+# installato, backup.sh avvisa e procede SENZA cifrare). Lascia vuoto per
+# disabilitare. Il destinatario è una chiave pubblica age, non un file:
+#   age-keygen -o key.txt   # stampa "Public key: age1..." — usa quella qui
+#                            # e conserva key.txt (privata) FUORI da questo host
+ENCRYPT_RECIPIENT=""

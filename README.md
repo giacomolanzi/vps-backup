@@ -75,9 +75,13 @@ ogni notte alle 02:00
         4. UFW (solo se installato)
         5. Named Docker volumes (tutti quelli sull'host, non solo quelli usati
            dagli stack sotto "docker/")
-        → <hostname>_backup_YYYY-MM-DD_HH-MM.tar.gz
-        → upload su Google Cloud Storage (se configurato)
-        → notifica Discord (se configurato)
+        → <hostname>_backup_YYYY-MM-DD_HH-MM.tar.gz  (permessi 600 — umask 077)
+        → verifica integrità (tar tzf) PRIMA di ruotare o caricare qualsiasi cosa
+        → cifratura opzionale (age), se ENCRYPT_RECIPIENT è impostato
+        → checksum sha256 salvato accanto all'archivio
+        → upload su Google Cloud Storage (se configurato, archivio + checksum)
+        → notifica Discord (se configurato), con alert se la dimensione è
+          anomala rispetto all'ultimo backup riuscito (>2× o <0.5×)
         → rotazione locale (KEEP_BACKUPS giorni)
 ```
 
@@ -132,9 +136,14 @@ tail -f /opt/backups/backup.log
 | `fail2ban/` | Configurazione fail2ban (se presente) |
 | `ufw/` | Regole firewall UFW (se installato) |
 | `docker_volumes/` | Tutti i named Docker volumes (`docker volume ls`) |
-| `config.sh` | Configurazione di questo host, inclusa nel backup per il restore |
+| `config.sh` | Configurazione di questo host, inclusa nel backup per il restore. `DISCORD_WEBHOOK` viene **redatto** (svuotato) prima di finire nell'archivio — reimpostalo a mano dopo un restore |
 | `restore.sh` | Copia dello script di restore |
 | `MANIFEST.txt` | Riepilogo: hostname, OS, servizi attivi al momento del backup |
+
+L'archivio finale nasce con permessi `600` (solo il proprietario può leggerlo —
+`umask 077` in cima a `backup.sh`) e accanto viene salvato un file
+`<archivio>.sha256`, caricato anch'esso su GCS, per verificare l'integrità
+prima di un restore (vedi sotto).
 
 > Se usi Postgres, escludi la sua directory dati dal tar via `DOCKER_EXCLUDES`
 > in `config.sh` (es. `"postgres/postgres-data"`) — viene già coperta da
@@ -178,7 +187,36 @@ docker run --rm \
   google/cloud-sdk:alpine \
   sh -c "gcloud auth activate-service-account --key-file=/key.json -q \
          && gsutil ls -lh <GCS_BUCKET>/"
+
+# Anteprima senza toccare nulla: cosa verrebbe incluso/escluso, stima dimensione
+bash /opt/backups/backup.sh --dry-run
 ```
+
+---
+
+## Cifratura opzionale dell'archivio (a riposo)
+
+Il bucket GCS è già protetto (accesso solo IAM, nessun membro pubblico), ma
+per una protezione aggiuntiva l'archivio finale può essere cifrato con
+[age](https://github.com/FiloSottile/age) prima dell'upload — opt-in, nessun
+impatto se non configurato:
+
+```bash
+# Una tantum, su una macchina FIDATA (non necessariamente l'host da backuppare):
+age-keygen -o key.txt
+# stampa "Public key: age1..." — quella va in ENCRYPT_RECIPIENT su ogni host
+# key.txt (la chiave PRIVATA) va conservata fuori da questo host, al sicuro
+
+# Sull'host da proteggere:
+apt install age   # o l'equivalente per la distro
+# in config.sh:
+ENCRYPT_RECIPIENT="age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+Se `ENCRYPT_RECIPIENT` è impostato ma `age` non è installato, `backup.sh`
+avvisa e procede **senza** cifrare (non blocca il backup). L'archivio cifrato
+ha estensione `.tar.gz.age` invece di `.tar.gz` — la verifica di integrità
+(`tar tzf`) avviene comunque prima della cifratura, sul tar in chiaro.
 
 ---
 
@@ -188,8 +226,14 @@ docker run --rm \
 apt update && apt install -y docker.io docker-compose-plugin curl
 systemctl enable --now docker
 
-# Recupera l'archivio (da GCS o scp), poi:
+# Recupera l'archivio E il suo <archivio>.sha256 (da GCS o scp), poi:
 mkdir -p /opt/restore && cd /opt/restore
+sha256sum -c <host>_backup_YYYY-MM-DD_HH-MM.tar.gz.sha256   # verifica integrità
+
+# Solo se l'archivio è cifrato (estensione .tar.gz.age, vedi sezione sopra):
+age -d -i key.txt -o <host>_backup_YYYY-MM-DD_HH-MM.tar.gz \
+    <host>_backup_YYYY-MM-DD_HH-MM.tar.gz.age
+
 tar xzf <host>_backup_YYYY-MM-DD_HH-MM.tar.gz
 cd .work_YYYY-MM-DD_HH-MM/
 sudo bash restore.sh
