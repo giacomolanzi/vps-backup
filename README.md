@@ -1,4 +1,4 @@
-# Backup System — portable
+# vps-backup
 
 ## Requirements
 
@@ -105,9 +105,10 @@ cd /opt/backups
 
 # 2. Create the host-specific config
 cp config.example.sh config.sh
-nano config.sh   # GCS bucket, Discord webhook, optional Postgres, networks to recreate
+nano config.sh   # see the Configuration reference below for every variable
 
-# 3. Copy the GCS key (not in git, transfer it by hand/scp)
+# 3. (optional, only if GCS_BUCKET is set) copy the GCS key
+#    (not in git, transfer it by hand/scp)
 #    /opt/backups/gcs-key.json
 
 chmod +x backup.sh restore.sh
@@ -131,6 +132,28 @@ Sudoers file contents (adapt `<user>` and the path portion if you put
 bash /opt/backups/backup.sh
 tail -f /opt/backups/backup.log
 ```
+
+---
+
+## Configuration reference
+
+All variables live in `config.sh` (copied from `config.example.sh`, not
+committed to git).
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `KEEP_BACKUPS` | yes | How many local archives to keep before rotating |
+| `GCS_BUCKET` | no | Target `gs://` bucket for offsite upload; leave empty to disable |
+| `DISCORD_WEBHOOK` | no | Webhook URL for backup notifications/alerts; leave empty to disable |
+| `PG_CONTAINER` | no | Name of the Postgres container to dump; leave empty if this host doesn't run Postgres in Docker |
+| `PG_USER` | no | Postgres user for the dump (used together with `PG_CONTAINER`) |
+| `DOCKER_EXCLUDES` | no | Array of host-specific paths (relative to `docker/`) to exclude from the tar, beyond the automatic exclusions |
+| `DOCKER_NETWORKS` | no | Array of external Docker networks to recreate during restore |
+| `ENCRYPT_RECIPIENT` | no | `age` public key; if set, the final archive is encrypted before upload (requires the `age` binary) |
+
+The GCS service account key, if used, is not a `config.sh` variable — it
+must be copied by hand to `gcs-key.json` alongside `config.sh` (see step 3
+above).
 
 ---
 

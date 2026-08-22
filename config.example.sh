@@ -1,41 +1,41 @@
 #!/bin/bash
 # =============================================================================
-# Configurazione backup — copia in config.sh (NON committato) e personalizza
-# Va posizionato nella stessa cartella di backup.sh/restore.sh
+# Backup configuration — copy to config.sh (NOT committed) and customize
+# Goes in the same folder as backup.sh/restore.sh
 # =============================================================================
 
-# Backup locale — quanti archivi tenere prima di ruotare
+# Local backups — how many archives to keep before rotating
 KEEP_BACKUPS=7
 
-# Google Cloud Storage (lascia GCS_BUCKET vuoto per disabilitare l'upload)
-GCS_BUCKET="gs://il-tuo-bucket"
-# La chiave del service account va salvata come gcs-key.json nella stessa
-# cartella di questo file — NON va committata in git (vedi .gitignore)
+# Google Cloud Storage (leave GCS_BUCKET empty to disable upload)
+GCS_BUCKET="gs://your-bucket"
+# The service account key must be saved as gcs-key.json in the same folder
+# as this file — do NOT commit it to git (see .gitignore)
 
-# Notifiche Discord (lascia vuoto per disabilitare)
+# Discord notifications (leave empty to disable)
 DISCORD_WEBHOOK=""
 
-# PostgreSQL — lascia entrambi vuoti se questo host non usa Postgres in Docker
+# PostgreSQL — leave both empty if this host doesn't run Postgres in Docker
 PG_CONTAINER=""
 PG_USER=""
 
-# Percorsi da escludere dal tar, relativi alla cartella "docker"
-# (es. dati Postgres già coperti da pg_dumpall, per evitare doppioni)
-# NB: .cache/.npm/node_modules/__pycache__/.venv sono già esclusi ovunque
-# automaticamente da backup.sh (DEFAULT_EXCLUDE_PATTERNS) — qui vanno solo
-# esclusioni specifiche di questo host.
+# Paths to exclude from the tar, relative to the "docker" folder
+# (e.g. Postgres data already covered by pg_dumpall, to avoid duplication)
+# NOTE: .cache/.npm/node_modules/__pycache__/.venv are already excluded
+# everywhere automatically by backup.sh (DEFAULT_EXCLUDE_PATTERNS) — only
+# host-specific exclusions belong here.
 DOCKER_EXCLUDES=(
     # "postgres/postgres-data"
 )
 
-# Reti Docker esterne da (ri)creare in fase di restore
+# External Docker networks to (re)create during restore
 DOCKER_NETWORKS=(
     # "homedeb_net"
 )
 
-# Cifratura opzionale dell'archivio finale (richiede il binario "age" — se non
-# installato, backup.sh avvisa e procede SENZA cifrare). Lascia vuoto per
-# disabilitare. Il destinatario è una chiave pubblica age, non un file:
-#   age-keygen -o key.txt   # stampa "Public key: age1..." — usa quella qui
-#                            # e conserva key.txt (privata) FUORI da questo host
+# Optional encryption of the final archive (requires the "age" binary — if
+# not installed, backup.sh warns and proceeds WITHOUT encrypting). Leave
+# empty to disable. The recipient is an age public key, not a file:
+#   age-keygen -o key.txt   # prints "Public key: age1..." — use that here
+#                            # and keep key.txt (private) OFF this host
 ENCRYPT_RECIPIENT=""
