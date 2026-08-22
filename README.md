@@ -1,22 +1,28 @@
-# Sistema di Backup — portabile
+# Backup System — portable
 
-## Idea di base
+## Requirements
 
-Due script generici (`backup.sh` e `restore.sh`) più un file di configurazione
-minimo (`config.sh`) per host. Zero path assoluti hardcoded: lo script deduce
-cosa backuppare dalla propria posizione.
+- A Linux host running Docker + Docker Compose
+- (optional) PostgreSQL running as one of the Docker services, for automatic DB dumps
+- (optional) A Google Cloud Storage bucket, for offsite upload
 
-**Convenzione:** metti la cartella `backups` (il contenuto di questo repo)
-affiancata a una cartella `docker` (dove vivono i tuoi `compose.yml` e i loro
-bind-mount):
+## Basic idea
+
+Two generic scripts (`backup.sh` and `restore.sh`) plus a minimal
+per-host config file (`config.sh`). Zero hardcoded absolute paths: the
+script figures out what to back up based on its own location.
+
+**Convention:** place the `backups` folder (the contents of this repo)
+alongside a `docker` folder (where your `compose.yml` files and their
+bind-mounts live):
 
 ```
 /opt/
-  backups/     ← questo repo
+  backups/     ← this repo
     backup.sh
     restore.sh
-    config.sh          (creato da te, non in git)
-    gcs-key.json        (copiato a mano, non in git)
+    config.sh          (created by you, not in git)
+    gcs-key.json        (copied by hand, not in git)
   docker/
     homeassistant/
       compose.yml
@@ -26,79 +32,82 @@ bind-mount):
       ...
 ```
 
-Funziona identico se lo metti sotto `/opt`, `~/srv`, o qualsiasi altra root —
-`backup.sh` risolve `../docker` relativo a se stesso.
+Works identically whether you place it under `/opt`, `~/srv`, or any
+other root — `backup.sh` resolves `../docker` relative to itself.
 
-**Stack annidati a qualsiasi profondità:** dentro `docker/` puoi organizzare
-gli stack come preferisci, anche in sottocartelle su più livelli (es.
-`docker/clienti/acme/n8n/compose.yml`). Sia `backup.sh` (che archivia
-l'intera cartella `docker/` con `tar`, che ricorre sempre in ogni sottolivello)
-sia `restore.sh` (che cerca ogni `compose.yml`/`docker-compose.yml` con `find`,
-non con un semplice `docker/*/compose.yml`) coprono qualunque profondità, non
-solo un livello sotto `docker/`.
+**Stacks nested at any depth:** inside `docker/` you can organize
+stacks however you like, including multi-level subfolders (e.g.
+`docker/clients/acme/n8n/compose.yml`). Both `backup.sh` (which
+archives the entire `docker/` folder with `tar`, always recursing into
+every sublevel) and `restore.sh` (which looks for every
+`compose.yml`/`docker-compose.yml` with `find`, not a plain
+`docker/*/compose.yml`) cover any depth, not just one level below
+`docker/`.
 
-**Volumi esterni: monta i dati dentro la cartella dello stack.** Se un
-container ha bisogno di un bind-mount per dati persistenti, fallo puntare
-dentro la cartella dello stack stesso — non altrove sul filesystem:
+**External volumes: mount data inside the stack's own folder.** If a
+container needs a bind-mount for persistent data, point it inside the
+stack's own folder — not elsewhere on the filesystem:
 
 ```
 docker/n8n/
   compose.yml
-  data/            ← bind-mount: "./data:/home/node/.n8n"  ✅ backuppato
+  data/            ← bind-mount: "./data:/home/node/.n8n"  ✅ backed up
 ```
 
 ```
-# ❌ evita:
-#   "/mnt/altrove/n8n-data:/home/node/.n8n"
-# non essendo dentro "docker/", questo mount NON finisce nel tar.
+# ❌ avoid:
+#   "/mnt/elsewhere/n8n-data:/home/node/.n8n"
+# since it's not inside "docker/", this mount does NOT end up in the tar.
 ```
 
-I **named Docker volume** (quelli "virtuali", gestiti da Docker e non da un
-path del filesystem) sono invece sempre inclusi automaticamente, ovunque siano
-usati — vedi step 5 sotto. La regola sui bind-mount vale solo per i mount con
-un path host esplicito.
+**Named Docker volumes** (the "virtual" ones, managed by Docker rather
+than a filesystem path) are instead always included automatically,
+wherever they're used — see step 5 below. The bind-mount rule only
+applies to mounts with an explicit host path.
 
-`backup.sh` rileva comunque, ad ogni run, eventuali bind-mount di container
-attivi che puntano fuori da `docker/` e li segnala (log + `MANIFEST.txt`),
-escludendo i mount di introspezione tipici di tool di monitoring (Glances su
-`/`, Diun sul `docker.sock`, `/proc`, `/sys`, `/etc`, ...). Se compare un
-avviso per un mount che contiene dati veri, spostalo dentro lo stack.
+On every run, `backup.sh` still detects any bind-mounts of running
+containers that point outside `docker/` and flags them (log +
+`MANIFEST.txt`), excluding the typical introspection mounts used by
+monitoring tools (Glances on `/`, Diun on `docker.sock`, `/proc`,
+`/sys`, `/etc`, ...). If a warning shows up for a mount that holds real
+data, move it inside the stack.
 
 ```
-ogni notte alle 02:00
-    → backup.sh  (legge config.sh)
-        1. pg_dumpall + dump individuali DB (solo se PG_CONTAINER è impostato)
-        2. tar della cartella "docker" (tutti gli stack, qualsiasi profondità;
-           esclude cache/.npm/node_modules/.venv/__pycache__ automaticamente,
-           più eventuali DOCKER_EXCLUDES specifiche dell'host)
+every night at 02:00
+    → backup.sh  (reads config.sh)
+        1. pg_dumpall + individual DB dumps (only if PG_CONTAINER is set)
+        2. tar of the "docker" folder (all stacks, any depth;
+           automatically excludes cache/.npm/node_modules/.venv/__pycache__,
+           plus any host-specific DOCKER_EXCLUDES)
         3. SSH + Fail2ban
-        4. UFW (solo se installato)
-        5. Named Docker volumes (tutti quelli sull'host, non solo quelli usati
-           dagli stack sotto "docker/")
-        → <hostname>_backup_YYYY-MM-DD_HH-MM.tar.gz  (permessi 600 — umask 077)
-        → verifica integrità (tar tzf) PRIMA di ruotare o caricare qualsiasi cosa
-        → cifratura opzionale (age), se ENCRYPT_RECIPIENT è impostato
-        → checksum sha256 salvato accanto all'archivio
-        → upload su Google Cloud Storage (se configurato, archivio + checksum)
-        → notifica Discord (se configurato), con alert se la dimensione è
-          anomala rispetto all'ultimo backup riuscito (>2× o <0.5×)
-        → rotazione locale (KEEP_BACKUPS giorni)
+        4. UFW (only if installed)
+        5. Named Docker volumes (all of them on the host, not just the
+           ones used by stacks under "docker/")
+        → <hostname>_backup_YYYY-MM-DD_HH-MM.tar.gz  (permissions 600 —
+          umask 077)
+        → integrity check (tar tzf) BEFORE rotating or uploading anything
+        → optional encryption (age), if ENCRYPT_RECIPIENT is set
+        → sha256 checksum saved alongside the archive
+        → upload to Google Cloud Storage (if configured, archive + checksum)
+        → Discord notification (if configured), with an alert if the size
+          is anomalous compared to the last successful backup (>2× or <0.5×)
+        → local rotation (KEEP_BACKUPS days)
 ```
 
 ---
 
-## Setup su un host nuovo
+## Setup on a new host
 
 ```bash
-# 1. Clona (o copia) questo repo in <root>/backups
+# 1. Clone (or copy) this repo into <root>/backups
 git clone <repo-url> /opt/backups
 cd /opt/backups
 
-# 2. Crea la config specifica dell'host
+# 2. Create the host-specific config
 cp config.example.sh config.sh
-nano config.sh   # bucket GCS, webhook Discord, eventuale Postgres, reti da ricreare
+nano config.sh   # GCS bucket, Discord webhook, optional Postgres, networks to recreate
 
-# 3. Copia la chiave GCS (non in git, va trasferita a mano/scp)
+# 3. Copy the GCS key (not in git, transfer it by hand/scp)
 #    /opt/backups/gcs-key.json
 
 chmod +x backup.sh restore.sh
@@ -107,130 +116,134 @@ chmod 600 gcs-key.json
 # 4. Cron
 (crontab -l 2>/dev/null; echo '0 2 * * * /opt/backups/backup.sh >> /opt/backups/backup.log 2>&1') | crontab -
 
-# 5. Sudo passwordless scoped (necessario per la copia di sshd_config nel cron)
-sudo visudo -f /etc/sudoers.d/<utente>-backup
+# 5. Scoped passwordless sudo (needed to copy sshd_config during the cron run)
+sudo visudo -f /etc/sudoers.d/<user>-backup
 ```
-Contenuto del file sudoers (adatta `<utente>` e la porzione di path se hai
-messo `backups` altrove):
+Sudoers file contents (adapt `<user>` and the path portion if you put
+`backups` somewhere else):
 ```
-<utente> ALL=(root) NOPASSWD: /usr/bin/cp /etc/ssh/sshd_config /opt/backups/.work_*/ssh/
-<utente> ALL=(root) NOPASSWD: /usr/bin/chown -R <utente> /opt/backups/.work_*/ssh/
+<user> ALL=(root) NOPASSWD: /usr/bin/cp /etc/ssh/sshd_config /opt/backups/.work_*/ssh/
+<user> ALL=(root) NOPASSWD: /usr/bin/chown -R <user> /opt/backups/.work_*/ssh/
 ```
 
 ```bash
-# 6. Test manuale
+# 6. Manual test
 bash /opt/backups/backup.sh
 tail -f /opt/backups/backup.log
 ```
 
 ---
 
-## Cosa include ogni backup
+## What each backup includes
 
-| Cartella nell'archivio | Contenuto |
+| Folder in the archive | Content |
 |---|---|
-| `postgres/pg_dumpall.sql.gz` | Dump completo (solo se `PG_CONTAINER` impostato) |
-| `postgres/<nome>.dump` | Dump individuale per DB, formato custom `pg_restore` |
-| `docker.tar.gz` | L'intera cartella `docker` affiancata: compose files, dati bind-mount |
-| `ssh/` | `sshd_config`, `authorized_keys`, nome utente SSH |
-| `fail2ban/` | Configurazione fail2ban (se presente) |
-| `ufw/` | Regole firewall UFW (se installato) |
-| `docker_volumes/` | Tutti i named Docker volumes (`docker volume ls`) |
-| `config.sh` | Configurazione di questo host, inclusa nel backup per il restore. `DISCORD_WEBHOOK` viene **redatto** (svuotato) prima di finire nell'archivio — reimpostalo a mano dopo un restore |
-| `restore.sh` | Copia dello script di restore |
-| `MANIFEST.txt` | Riepilogo: hostname, OS, servizi attivi al momento del backup |
+| `postgres/pg_dumpall.sql.gz` | Full dump (only if `PG_CONTAINER` is set) |
+| `postgres/<name>.dump` | Individual per-DB dump, `pg_restore` custom format |
+| `docker.tar.gz` | The entire sibling `docker` folder: compose files, bind-mount data |
+| `ssh/` | `sshd_config`, `authorized_keys`, SSH username |
+| `fail2ban/` | fail2ban configuration (if present) |
+| `ufw/` | UFW firewall rules (if installed) |
+| `docker_volumes/` | All named Docker volumes (`docker volume ls`) |
+| `config.sh` | This host's configuration, included in the backup for restore purposes. `DISCORD_WEBHOOK` is **redacted** (emptied) before it ends up in the archive — set it again by hand after a restore |
+| `restore.sh` | A copy of the restore script |
+| `MANIFEST.txt` | Summary: hostname, OS, services active at backup time |
 
-L'archivio finale nasce con permessi `600` (solo il proprietario può leggerlo —
-`umask 077` in cima a `backup.sh`) e accanto viene salvato un file
-`<archivio>.sha256`, caricato anch'esso su GCS, per verificare l'integrità
-prima di un restore (vedi sotto).
+The final archive is created with `600` permissions (only the owner
+can read it — `umask 077` at the top of `backup.sh`), and a
+`<archive>.sha256` file is saved alongside it and also uploaded to
+GCS, to verify integrity before a restore (see below).
 
-> Se usi Postgres, escludi la sua directory dati dal tar via `DOCKER_EXCLUDES`
-> in `config.sh` (es. `"postgres/postgres-data"`) — viene già coperta da
-> `pg_dumpall`, evitando di duplicarla e rischiare corruzione da file aperti.
+> If you use Postgres, exclude its data directory from the tar via
+> `DOCKER_EXCLUDES` in `config.sh` (e.g. `"postgres/postgres-data"`) —
+> it's already covered by `pg_dumpall`, avoiding duplication and the
+> risk of corruption from open files.
 
-> **Esclusioni automatiche:** `.cache`, `.npm`, `node_modules`, `__pycache__`,
-> `.venv` vengono esclusi dal tar ovunque si trovino sotto `docker/`, su ogni
-> host, senza bisogno di configurazione (pattern `DEFAULT_EXCLUDE_PATTERNS` in
-> `backup.sh`). Usa `DOCKER_EXCLUDES` in `config.sh` solo per casi specifici
-> dell'host che non rientrano in questi pattern.
+> **Automatic exclusions:** `.cache`, `.npm`, `node_modules`,
+> `__pycache__`, `.venv` are excluded from the tar wherever they're
+> found under `docker/`, on every host, with no configuration needed
+> (the `DEFAULT_EXCLUDE_PATTERNS` pattern in `backup.sh`). Use
+> `DOCKER_EXCLUDES` in `config.sh` only for host-specific cases that
+> don't fall under these patterns.
 
-> Servizi **non containerizzati** (es. un processo nativo via systemd) non
-> sono coperti automaticamente: se hanno dati importanti, mettili comunque
-> dentro la cartella `docker` (il nome è solo convenzionale, `backup.sh` tarra
-> tutto quello che trova lì) o aggiungi un passo manuale.
+> **Non-containerized** services (e.g. a native process via systemd)
+> are not covered automatically: if they hold important data, put them
+> inside the `docker` folder anyway (the name is purely conventional —
+> `backup.sh` tars everything it finds there) or add a manual step.
 
 ---
 
-## Operazioni comuni
+## Common operations
 
 ```bash
-# Backup manuale in foreground
+# Manual backup in the foreground
 bash /opt/backups/backup.sh
 
-# In background (consigliato per backup grandi)
+# In the background (recommended for large backups)
 nohup bash /opt/backups/backup.sh >> /opt/backups/backup.log 2>&1 &
 tail -f /opt/backups/backup.log
 
-# Verifica backup locali
+# Check local backups
 ls -lh /opt/backups/*_backup_*.tar.gz
 
-# Log del cron
+# Cron log
 tail -100 /opt/backups/backup.log
 
-# Ispeziona un archivio senza estrarlo
+# Inspect an archive without extracting it
 tar tzf /opt/backups/<host>_backup_YYYY-MM-DD_HH-MM.tar.gz
 
-# Vedere i backup su GCS
+# List backups on GCS
 docker run --rm \
   -v /opt/backups/gcs-key.json:/key.json:ro \
   google/cloud-sdk:alpine \
   sh -c "gcloud auth activate-service-account --key-file=/key.json -q \
          && gsutil ls -lh <GCS_BUCKET>/"
 
-# Anteprima senza toccare nulla: cosa verrebbe incluso/escluso, stima dimensione
+# Dry run: preview what would be included/excluded and the estimated size,
+# without touching anything
 bash /opt/backups/backup.sh --dry-run
 ```
 
 ---
 
-## Cifratura opzionale dell'archivio (a riposo)
+## Optional archive encryption (at rest)
 
-Il bucket GCS è già protetto (accesso solo IAM, nessun membro pubblico), ma
-per una protezione aggiuntiva l'archivio finale può essere cifrato con
-[age](https://github.com/FiloSottile/age) prima dell'upload — opt-in, nessun
-impatto se non configurato:
+The GCS bucket is already protected (IAM-only access, no public
+members), but for extra protection the final archive can be encrypted
+with [age](https://github.com/FiloSottile/age) before upload —
+opt-in, no impact if left unconfigured:
 
 ```bash
-# Una tantum, su una macchina FIDATA (non necessariamente l'host da backuppare):
+# One-time, on a TRUSTED machine (not necessarily the host being backed up):
 age-keygen -o key.txt
-# stampa "Public key: age1..." — quella va in ENCRYPT_RECIPIENT su ogni host
-# key.txt (la chiave PRIVATA) va conservata fuori da questo host, al sicuro
+# prints "Public key: age1..." — that goes into ENCRYPT_RECIPIENT on each host
+# key.txt (the PRIVATE key) should be kept off this host, somewhere safe
 
-# Sull'host da proteggere:
-apt install age   # o l'equivalente per la distro
+# On the host to protect:
+apt install age   # or the equivalent for your distro
 # in config.sh:
 ENCRYPT_RECIPIENT="age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
-Se `ENCRYPT_RECIPIENT` è impostato ma `age` non è installato, `backup.sh`
-avvisa e procede **senza** cifrare (non blocca il backup). L'archivio cifrato
-ha estensione `.tar.gz.age` invece di `.tar.gz` — la verifica di integrità
-(`tar tzf`) avviene comunque prima della cifratura, sul tar in chiaro.
+If `ENCRYPT_RECIPIENT` is set but `age` isn't installed, `backup.sh`
+warns and proceeds **without** encrypting (it doesn't block the
+backup). The encrypted archive gets a `.tar.gz.age` extension instead
+of `.tar.gz` — the integrity check (`tar tzf`) still runs before
+encryption, on the plaintext tar.
 
 ---
 
-## Ripristino completo su host fresco
+## Full restore on a fresh host
 
 ```bash
 apt update && apt install -y docker.io docker-compose-plugin curl
 systemctl enable --now docker
 
-# Recupera l'archivio E il suo <archivio>.sha256 (da GCS o scp), poi:
+# Fetch the archive AND its <archive>.sha256 (from GCS or scp), then:
 mkdir -p /opt/restore && cd /opt/restore
-sha256sum -c <host>_backup_YYYY-MM-DD_HH-MM.tar.gz.sha256   # verifica integrità
+sha256sum -c <host>_backup_YYYY-MM-DD_HH-MM.tar.gz.sha256   # verify integrity
 
-# Solo se l'archivio è cifrato (estensione .tar.gz.age, vedi sezione sopra):
+# Only if the archive is encrypted (.tar.gz.age extension, see section above):
 age -d -i key.txt -o <host>_backup_YYYY-MM-DD_HH-MM.tar.gz \
     <host>_backup_YYYY-MM-DD_HH-MM.tar.gz.age
 
@@ -239,57 +252,58 @@ cd .work_YYYY-MM-DD_HH-MM/
 sudo bash restore.sh
 ```
 
-`restore.sh` ricrea `docker/` accanto a se stesso rispettando la stessa
-convenzione di `backup.sh` — se lo esegui da `/opt/restore/.work_.../`, la
-cartella Docker finisce in `/opt/docker` (il path assoluto originale, salvato
-dentro il tar). Se vuoi un'altra posizione, sposta prima la cartella estratta
-dove desideri che finisca `docker/` come sibling.
+`restore.sh` recreates `docker/` alongside itself, following the same
+convention as `backup.sh` — if you run it from
+`/opt/restore/.work_.../`, the Docker folder ends up at `/opt/docker`
+(the original absolute path, saved inside the tar). If you want a
+different location, move the extracted folder first to wherever you
+want `docker/` to end up as a sibling.
 
-### Cosa fa, in ordine
+### What it does, in order
 
-1. **SSH + Fail2ban** — ripristina `sshd_config`, `authorized_keys`. Chiede
-   conferma che SSH funzioni prima di continuare.
-2. **UFW** — solo se presente nel backup.
-3. **Docker dir** — estrae l'intero tar.
-4. **Reti Docker** — crea quelle elencate in `DOCKER_NETWORKS`.
-5. **Named volumes** — ripristina tutti i volumi Docker.
-6. **Servizi** — avvia Postgres (se configurato) e attende sia pronto,
-   ripristina i DB, poi avvia dinamicamente ogni `compose.yml` trovato nella
-   cartella Docker.
+1. **SSH + Fail2ban** — restores `sshd_config`, `authorized_keys`. Asks
+   for confirmation that SSH works before continuing.
+2. **UFW** — only if present in the backup.
+3. **Docker dir** — extracts the entire tar.
+4. **Docker networks** — creates the ones listed in `DOCKER_NETWORKS`.
+5. **Named volumes** — restores all Docker volumes.
+6. **Services** — starts Postgres (if configured) and waits for it to
+   be ready, restores the DBs, then dynamically starts every
+   `compose.yml` found in the Docker folder.
 
-### Dopo il restore
+### After the restore
 
-- Verifica ogni servizio nel browser
-- `docker logs <container>` per eventuali errori
-- Riconfigura token/secret di terze parti
-- Ripristina manualmente eventuali servizi non-Docker (es. systemd nativi)
+- Check every service in the browser
+- `docker logs <container>` for any errors
+- Reconfigure third-party tokens/secrets
+- Manually restore any non-Docker services (e.g. native systemd units)
 
 ---
 
 ## Retention
 
-| Posizione | Retention | Gestione |
+| Location | Retention | Managed by |
 |---|---|---|
-| Locale (`backups/`) | `KEEP_BACKUPS` giorni | Rotazione automatica in `backup.sh` |
-| GCS | Dipende dal bucket | Lifecycle rule impostata sul bucket stesso |
+| Local (`backups/`) | `KEEP_BACKUPS` days | Automatic rotation in `backup.sh` |
+| GCS | Depends on the bucket | Lifecycle rule set on the bucket itself |
 
 ---
 
-## Aggiungere o rimuovere servizi Docker
+## Adding or removing Docker services
 
-**Nessuna modifica necessaria.** Il sistema è dinamico:
+**No changes needed.** The system is dynamic:
 
-- Nuovo servizio in `docker/<nome>/compose.yml` (o annidato più in profondità) → incluso automaticamente
-- Nuovo database PostgreSQL → incluso automaticamente in `pg_dumpall`
-- Nuovo named volume → incluso automaticamente da `docker volume ls`, ovunque sia usato
-- Nuova cache (`.cache`, `.npm`, `node_modules`, ...) → esclusa automaticamente dal tar
+- New service under `docker/<name>/compose.yml` (or nested deeper) → automatically included
+- New PostgreSQL database → automatically included in `pg_dumpall`
+- New named volume → automatically included via `docker volume ls`, wherever it's used
+- New cache folder (`.cache`, `.npm`, `node_modules`, ...) → automatically excluded from the tar
 
 ---
 
-## Note su Diun
+## Note on Diun
 
-I `compose.yml` in questo tipo di setup portano tipicamente una label
-`diun.metadata.compose_path=<path assoluto del compose.yml>`, usata da
-[Diun](https://github.com/crazy-max/diun) per le notifiche di aggiornamento
-immagini e per sapere dove si trova il file da cui è stato lanciato il
-servizio. Non ha alcun ruolo nel backup stesso.
+Compose files in this kind of setup typically carry a
+`diun.metadata.compose_path=<absolute path to compose.yml>` label, used
+by [Diun](https://github.com/crazy-max/diun) for image-update
+notifications and to know where the file that launched the service
+lives. It plays no role in the backup itself.
