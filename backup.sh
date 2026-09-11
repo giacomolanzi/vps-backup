@@ -39,14 +39,19 @@ source "${SCRIPT_DIR}/config.sh"
 GCS_KEY="${SCRIPT_DIR}/gcs-key.json"
 
 BACKUP_DATE=$(date +%Y-%m-%d_%H-%M)
-# ARCHIVE_DIR (opzionale, in config.sh): destinazione degli archivi finali,
-# se diversa da SCRIPT_DIR — utile per tenerli su una partizione diversa da
-# quella di root. Se non impostata, comportamento invariato (archivi accanto
-# allo script). Non tocca DOCKER_DIR, che resta relativo a SCRIPT_DIR.
-BACKUP_BASE="${ARCHIVE_DIR:-${SCRIPT_DIR}}"
-mkdir -p "${BACKUP_BASE}"
-WORK_DIR="${BACKUP_BASE}/.work_${BACKUP_DATE}"
-ARCHIVE="${BACKUP_BASE}/$(hostname)_backup_${BACKUP_DATE}.tar.gz"
+# La cartella di lavoro temporanea resta sempre accanto allo script: è
+# piccola e cancellata subito dopo ogni run, e alcuni file al suo interno
+# (ssh/, fail2ban/, ufw/) vengono scritti con "sudo cp"/"sudo chown" tramite
+# una regola sudoers NOPASSWD vincolata al path letterale SCRIPT_DIR/.work_*
+# — spostarla romperebbe quella regola.
+WORK_DIR="${SCRIPT_DIR}/.work_${BACKUP_DATE}"
+# ARCHIVE_DIR (opzionale, in config.sh): destinazione dei soli archivi
+# finali (quelli che si accumulano fino a KEEP_BACKUPS), se diversa da
+# SCRIPT_DIR — utile per tenerli su una partizione diversa da quella di
+# root. Se non impostata, comportamento invariato.
+ARCHIVE_BASE="${ARCHIVE_DIR:-${SCRIPT_DIR}}"
+mkdir -p "${ARCHIVE_BASE}"
+ARCHIVE="${ARCHIVE_BASE}/$(hostname)_backup_${BACKUP_DATE}.tar.gz"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} $*"; }
@@ -61,11 +66,20 @@ discord() {
         -d "{\"embeds\":[{\"title\":\"${title}\",\"description\":\"${message}\",\"color\":${color}}]}"
 }
 
+ARCHIVE_VERIFIED=false
 on_error() {
     local line="$1"
     discord 15158332 "❌ Backup fallito — $(hostname)" \
-        "Errore alla riga ${line}\\nData: ${BACKUP_DATE}\\nControlla: \`tail -50 ${BACKUP_BASE}/backup.log\`"
+        "Errore alla riga ${line}\\nData: ${BACKUP_DATE}\\nControlla: \`tail -50 ${SCRIPT_DIR}/backup.log\`"
     [ -d "${WORK_DIR}" ] && rm -rf "${WORK_DIR}"
+    # Un archivio non ancora verificato con "tar tzf" può essere troncato
+    # (es. tar czf interrotto per disco pieno) — non lasciarlo sul disco,
+    # altrimenti si accumula senza mai liberare spazio (causa dell'incidente
+    # del 2026-09-09: un archivio corrotto mai ripulito ha bloccato la
+    # rotazione dei backup successivi).
+    if ! ${ARCHIVE_VERIFIED} && [ -n "${ARCHIVE:-}" ] && [ -f "${ARCHIVE}" ]; then
+        rm -f "${ARCHIVE}"
+    fi
 }
 trap 'on_error $LINENO' ERR
 trap '[ -d "${WORK_DIR}" ] && rm -rf "${WORK_DIR}"' EXIT
@@ -91,11 +105,33 @@ done
 
 # Dimensione dell'ultimo backup riuscito, per l'alert di anomalia più sotto
 # (va letta ORA, prima di creare/ruotare qualunque cosa).
-PREV_ARCHIVE=$(ls -t "${BACKUP_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' | head -1 || true)
+PREV_ARCHIVE=$(ls -t "${ARCHIVE_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' | head -1 || true)
 PREV_SIZE_BYTES=0
 if [ -n "${PREV_ARCHIVE:-}" ] && [ -f "${PREV_ARCHIVE}" ]; then
     PREV_SIZE_BYTES=$(stat -c%s "${PREV_ARCHIVE}" 2>/dev/null || echo 0)
 fi
+
+# Alert precoce se lo spazio libero è sotto ~2x l'ultimo backup, sulle
+# partizioni usate da WORK_DIR e dall'archivio finale (possono essere
+# diverse se è impostato ARCHIVE_DIR) — così si scopre il rischio prima
+# che il backup fallisca a metà, non dal log del mattino dopo.
+check_free_space() {
+    local path="$1" label="$2"
+    local avail_bytes
+    avail_bytes=$(df -B1 --output=avail "${path}" 2>/dev/null | tail -1 | tr -d ' ')
+    [ -z "${avail_bytes}" ] && return 0
+    local threshold=$(( PREV_SIZE_BYTES > 0 ? PREV_SIZE_BYTES * 2 : 1073741824 ))
+    if [ "${avail_bytes}" -lt "${threshold}" ]; then
+        local avail_human threshold_human
+        avail_human=$(numfmt --to=iec "${avail_bytes}" 2>/dev/null || echo "${avail_bytes} bytes")
+        threshold_human=$(numfmt --to=iec "${threshold}" 2>/dev/null || echo "${threshold} bytes")
+        warn "Spazio libero basso su ${label} (${path}): ${avail_human} disponibili (soglia: ${threshold_human})"
+        discord 16776960 "⚠️ Spazio disco basso — $(hostname)" \
+            "**${label}:** ${avail_human} disponibili su \`${path}\`\\nSoglia: ${threshold_human} (2x ultimo backup)\\nQuesto backup potrebbe fallire per mancanza di spazio."
+    fi
+}
+check_free_space "${SCRIPT_DIR}" "partizione cartella di lavoro"
+[ "${ARCHIVE_BASE}" != "${SCRIPT_DIR}" ] && check_free_space "${ARCHIVE_BASE}" "partizione archivi"
 
 # =============================================================================
 # --dry-run: mostra cosa verrebbe fatto, non tocca nulla, non carica nulla.
@@ -289,12 +325,13 @@ fi
 # Archivio finale + verifica integrità + cifratura opzionale + checksum
 # =============================================================================
 log "Creazione archivio finale..."
-tar czf "${ARCHIVE}" -C "${BACKUP_BASE}" ".work_${BACKUP_DATE}/"
+tar czf "${ARCHIVE}" -C "${SCRIPT_DIR}" ".work_${BACKUP_DATE}/"
 
 # Verifica integrità PRIMA di ruotare i backup vecchi: se l'archivio appena
 # creato è corrotto, questo comando fallisce, il trap ERR notifica su Discord
 # e lo script si interrompe qui — senza cancellare nessun backup precedente.
 tar tzf "${ARCHIVE}" >/dev/null
+ARCHIVE_VERIFIED=true
 log "   Integrità verificata (tar tzf)"
 
 if [ -n "${ENCRYPT_RECIPIENT:-}" ]; then
@@ -333,10 +370,10 @@ trap - EXIT
 # Rotazione (copre sia .tar.gz che .tar.gz.age, più i rispettivi .sha256)
 # =============================================================================
 log "Rotazione: mantengo gli ultimi ${KEEP_BACKUPS} backup..."
-ls -t "${BACKUP_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' \
+ls -t "${ARCHIVE_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' \
     | tail -n "+$((KEEP_BACKUPS + 1))" \
     | while read -r OLD; do rm -f "${OLD}" "${OLD}.sha256"; done
-REMAINING=$(ls "${BACKUP_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' | wc -l)
+REMAINING=$(ls "${ARCHIVE_BASE}/$(hostname)_backup_"*.tar.gz* 2>/dev/null | grep -v '\.sha256$' | wc -l)
 log "Backup disponibili: ${REMAINING}"
 
 # =============================================================================
