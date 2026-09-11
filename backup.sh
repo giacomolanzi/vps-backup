@@ -39,7 +39,12 @@ source "${SCRIPT_DIR}/config.sh"
 GCS_KEY="${SCRIPT_DIR}/gcs-key.json"
 
 BACKUP_DATE=$(date +%Y-%m-%d_%H-%M)
-BACKUP_BASE="${SCRIPT_DIR}"
+# ARCHIVE_DIR (opzionale, in config.sh): destinazione degli archivi finali,
+# se diversa da SCRIPT_DIR — utile per tenerli su una partizione diversa da
+# quella di root. Se non impostata, comportamento invariato (archivi accanto
+# allo script). Non tocca DOCKER_DIR, che resta relativo a SCRIPT_DIR.
+BACKUP_BASE="${ARCHIVE_DIR:-${SCRIPT_DIR}}"
+mkdir -p "${BACKUP_BASE}"
 WORK_DIR="${BACKUP_BASE}/.work_${BACKUP_DATE}"
 ARCHIVE="${BACKUP_BASE}/$(hostname)_backup_${BACKUP_DATE}.tar.gz"
 

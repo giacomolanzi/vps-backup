@@ -7,6 +7,12 @@
 # Local backups — how many archives to keep before rotating
 KEEP_BACKUPS=7
 
+# Where to write the final archives, if different from this folder — e.g. to
+# keep them off a small root partition. Leave empty/unset for the default
+# (archives next to backup.sh). Does NOT affect DOCKER_DIR, which stays
+# relative to backup.sh's own location.
+ARCHIVE_DIR=""
+
 # Google Cloud Storage (leave GCS_BUCKET empty to disable upload)
 GCS_BUCKET="gs://your-bucket"
 # The service account key must be saved as gcs-key.json in the same folder
