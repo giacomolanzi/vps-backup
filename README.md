@@ -143,6 +143,7 @@ committed to git).
 | Variable | Required | Purpose |
 |---|---|---|
 | `KEEP_BACKUPS` | yes | How many local archives to keep before rotating |
+| `ARCHIVE_DIR` | no | Where to write the final archives, if different from this folder (e.g. to keep them off a small root partition). Does not affect where `backup.sh` itself lives or `DOCKER_DIR` |
 | `GCS_BUCKET` | no | Target `gs://` bucket for offsite upload; leave empty to disable |
 | `DISCORD_WEBHOOK` | no | Webhook URL for backup notifications/alerts; leave empty to disable |
 | `PG_CONTAINER` | no | Name of the Postgres container to dump; leave empty if this host doesn't run Postgres in Docker |
@@ -154,6 +155,22 @@ committed to git).
 The GCS service account key, if used, is not a `config.sh` variable — it
 must be copied by hand to `gcs-key.json` alongside `config.sh` (see step 3
 above).
+
+### Command-line overrides
+
+Any of `KEEP_BACKUPS`, `ARCHIVE_DIR`, `GCS_BUCKET`, `DISCORD_WEBHOOK`,
+`PG_CONTAINER`, `PG_USER` can be overridden for a single run without
+touching `config.sh`, via `--flag=value`:
+
+```bash
+bash backup.sh --keep-backups=3 --gcs-bucket=  # skip rotation limit, skip upload for this run
+bash backup.sh --archive-dir=/mnt/backups-test --dry-run
+```
+
+An override applies only to that invocation — `config.sh` on disk is
+never modified. `--flag=` (empty value) is a valid override too, e.g. to
+disable GCS upload or Discord notifications for one run. Run
+`backup.sh --help` for the full flag list.
 
 ---
 

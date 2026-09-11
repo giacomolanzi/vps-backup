@@ -13,9 +13,18 @@
 #         checksum + verifica integrità, cifratura opzionale, alert su
 #         anomalie di dimensione
 # Usage: ./backup.sh [--no-volumes] [--dry-run]
+#                     [--keep-backups=N] [--archive-dir=PATH] [--gcs-bucket=URL]
+#                     [--discord-webhook=URL] [--pg-container=NAME] [--pg-user=NAME]
+# I flag di override sostituiscono il valore corrispondente in config.sh solo
+# per questa run (non lo modificano su disco). Omessi, resta il valore di
+# config.sh.
 # =============================================================================
 set -euo pipefail
 umask 077
+
+usage() {
+    grep '^# ' "${BASH_SOURCE[0]}" | head -15 | sed 's/^# \{0,1\}//'
+}
 
 DRY_RUN=false
 NO_VOLUMES=false
@@ -23,6 +32,14 @@ for ARG in "$@"; do
     case "${ARG}" in
         --dry-run) DRY_RUN=true ;;
         --no-volumes) NO_VOLUMES=true ;;
+        --help|-h) usage; exit 0 ;;
+        --keep-backups=*) OVERRIDE_KEEP_BACKUPS="${ARG#*=}" ;;
+        --archive-dir=*) OVERRIDE_ARCHIVE_DIR="${ARG#*=}" ;;
+        --gcs-bucket=*) OVERRIDE_GCS_BUCKET="${ARG#*=}" ;;
+        --discord-webhook=*) OVERRIDE_DISCORD_WEBHOOK="${ARG#*=}" ;;
+        --pg-container=*) OVERRIDE_PG_CONTAINER="${ARG#*=}" ;;
+        --pg-user=*) OVERRIDE_PG_USER="${ARG#*=}" ;;
+        --*) echo "ERROR: opzione sconosciuta: ${ARG} (--help per l'elenco)" >&2; exit 1 ;;
     esac
 done
 
@@ -35,6 +52,16 @@ if [ ! -f "${SCRIPT_DIR}/config.sh" ]; then
     exit 1
 fi
 source "${SCRIPT_DIR}/config.sh"
+
+# Gli override da riga di comando vincono su config.sh, solo per questa run.
+# "${VAR+x}" (non "-n") per distinguere "flag non passato" da "flag passato
+# con valore vuoto" (es. --gcs-bucket= per disabilitare l'upload per un run).
+[ "${OVERRIDE_KEEP_BACKUPS+x}" ] && KEEP_BACKUPS="${OVERRIDE_KEEP_BACKUPS}"
+[ "${OVERRIDE_ARCHIVE_DIR+x}" ] && ARCHIVE_DIR="${OVERRIDE_ARCHIVE_DIR}"
+[ "${OVERRIDE_GCS_BUCKET+x}" ] && GCS_BUCKET="${OVERRIDE_GCS_BUCKET}"
+[ "${OVERRIDE_DISCORD_WEBHOOK+x}" ] && DISCORD_WEBHOOK="${OVERRIDE_DISCORD_WEBHOOK}"
+[ "${OVERRIDE_PG_CONTAINER+x}" ] && PG_CONTAINER="${OVERRIDE_PG_CONTAINER}"
+[ "${OVERRIDE_PG_USER+x}" ] && PG_USER="${OVERRIDE_PG_USER}"
 
 GCS_KEY="${SCRIPT_DIR}/gcs-key.json"
 
